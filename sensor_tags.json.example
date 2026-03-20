@@ -1,0 +1,12 @@
+{
+  "comment": "Copy this file to sensor_tags.json and fill in your PLC tag names. sensor_tags.json is git-ignored.",
+  "L1Z1": { "entry": "L1Z1_Entry", "exit": "L1Z1_Exit" },
+  "L1Z2": { "entry": "L1Z2_Entry", "exit": "L1Z2_Exit" },
+  "L1Z3": { "entry": "L1Z3_Entry", "exit": "L1Z3_Exit" },
+  "L2Z1": { "entry": "L2Z1_Entry", "exit": "L2Z1_Exit" },
+  "L2Z2": { "entry": "L2Z2_Entry", "exit": "L2Z2_Exit" },
+  "L2Z3": { "entry": "L2Z3_Entry", "exit": "L2Z3_Exit" },
+  "L3Z1": { "entry": "L3Z1_Entry", "exit": "L3Z1_Exit" },
+  "L3Z2": { "entry": "L3Z2_Entry", "exit": "L3Z2_Exit" },
+  "L3Z3": { "entry": "L3Z3_Entry", "exit": "L3Z3_Exit" }
+}

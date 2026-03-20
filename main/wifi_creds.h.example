@@ -1,0 +1,19 @@
+#pragma once
+/*
+ * wifi_creds.h.example – copy to wifi_creds.h and fill in your values.
+ *
+ * wifi_creds.h is listed in .gitignore and must NEVER be committed.
+ */
+
+/** Wi-Fi SSID for the network that hosts the MQTT broker. */
+#define WIFI_SSID        "your_wifi_ssid_here"
+
+/** Wi-Fi password. */
+#define WIFI_PASSWORD    "your_wifi_password_here"
+
+/**
+ * IP address (or hostname) of the PC running the MQTT broker.
+ * During PLC-hosted testing this is typically the PLC PC's LAN IP,
+ * e.g. "192.168.20.130".
+ */
+#define WIFI_MQTT_BROKER "192.168.20.130"

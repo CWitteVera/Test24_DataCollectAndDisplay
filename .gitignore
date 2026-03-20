@@ -10,3 +10,8 @@ managed_components/
 # OS
 Thumbs.db
 .DS_Store
+
+# Conveyor monitor – user-supplied secrets/config (never commit)
+sensor_tags.json
+main/wifi_creds.h
+conveyor_data.db

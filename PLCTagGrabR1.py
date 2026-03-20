@@ -2,7 +2,7 @@ import tkinter as tk
 from tkinter import ttk, messagebox
 import json
 import os
-from datetime import datetime
+from datetime import datetime, date
 import threading
 import time
 from collections import defaultdict
@@ -11,6 +11,13 @@ import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 import matplotlib.dates as mdates
+
+from zone_tracker import ZoneTracker, ZONES
+from db_logger import DBLogger
+from mqtt_service import MQTTService
+
+# How often (seconds) to push zone counts to MQTT
+MQTT_PUBLISH_INTERVAL = 5
 
 class PLCTagReader:
     # Configuration constants
@@ -44,7 +51,21 @@ class PLCTagReader:
         
         # Track pulse counts per tag
         self.pulse_counts = {}
-        
+
+        # ── Conveyor zone tracking ────────────────────────────────────
+        self.zone_tracker = ZoneTracker()
+        self.db_logger = DBLogger()
+        self.mqtt_service = MQTTService(
+            broker=self.config.get("mqtt_broker", "localhost"),
+            port=self.config.get("mqtt_port", 1883),
+        )
+        # Restore today's daily totals from the database
+        self.zone_tracker.restore_daily_totals(self.db_logger.get_daily_totals())
+        # Track last midnight-reset date
+        self._last_reset_date = str(date.today())
+        # Track last MQTT publish time
+        self._last_mqtt_publish = 0.0
+
         self.setup_ui()
         
         # Load persisted tags and pairs
@@ -52,6 +73,11 @@ class PLCTagReader:
         
     def load_config(self):
         """Load saved IP addresses and settings"""
+        defaults = {
+            "ip_addresses": [], "last_ip": "", "active_tags": [],
+            "tag_pairs": {}, "pulse_counts": {},
+            "mqtt_broker": "localhost", "mqtt_port": 1883,
+        }
         if os.path.exists(self.config_file):
             try:
                 with open(self.config_file, 'r') as f:
@@ -59,10 +85,13 @@ class PLCTagReader:
                     # Initialize pulse counts from config
                     if 'pulse_counts' in config:
                         self.pulse_counts = config['pulse_counts']
+                    # Ensure new keys exist
+                    for k, v in defaults.items():
+                        config.setdefault(k, v)
                     return config
             except:
-                return {"ip_addresses": [], "last_ip": "", "active_tags": [], "tag_pairs": {}, "pulse_counts": {}}
-        return {"ip_addresses": [], "last_ip": "", "active_tags": [], "tag_pairs": {}, "pulse_counts": {}}
+                return defaults
+        return defaults
     
     def save_config(self):
         """Save IP addresses and settings"""
@@ -108,7 +137,7 @@ class PLCTagReader:
     def setup_ui(self):
         """Create the user interface with toolbar and three-panel layout.
 
-        Left: configuration. Center: live monitor. Right: live bar graph.
+        Left: configuration. Center: notebook (monitor | zones). Right: live bar graph.
         """
         # Basic style adjustments
         style = ttk.Style()
@@ -127,11 +156,16 @@ class PLCTagReader:
         ttk.Button(toolbar, text='Refresh Graph', command=self.refresh_graph).pack(side=tk.LEFT, padx=4)
         ttk.Button(toolbar, text='Reset Pulses', command=self.reset_pulse_counts).pack(side=tk.LEFT, padx=4)
 
+        # MQTT connect/status on toolbar
+        ttk.Button(toolbar, text='Connect MQTT', command=self.connect_mqtt).pack(side=tk.LEFT, padx=4)
+        self.mqtt_status_pill = tk.Label(toolbar, text='MQTT: Off', bg='#f0f0f0', fg='#333', padx=8, pady=2)
+        self.mqtt_status_pill.pack(side=tk.LEFT, padx=4)
+
         # Status pill on toolbar
         self.status_pill = tk.Label(toolbar, text='Idle', bg='#f0f0f0', fg='#333', padx=8, pady=2)
         self.status_pill.pack(side=tk.RIGHT, padx=8)
 
-        # Main panes: left config, right (monitor above graph)
+        # Main panes: left config, right notebook
         main_pane = ttk.PanedWindow(self.root, orient=tk.HORIZONTAL)
         main_pane.pack(fill=tk.BOTH, expand=True)
 
@@ -141,19 +175,27 @@ class PLCTagReader:
         main_pane.add(left_frame, weight=1)
         main_pane.add(right_pane, weight=3)
 
-        monitor_frame = ttk.Frame(right_pane)
+        # Right pane: notebook (Monitor / Conveyor Zones) above graph
+        right_nb = ttk.Notebook(right_pane)
+        monitor_frame = ttk.Frame(right_nb)
+        zones_frame = ttk.Frame(right_nb)
+        right_nb.add(monitor_frame, text='Monitor')
+        right_nb.add(zones_frame, text='Conveyor Zones')
+
         graph_frame = ttk.Frame(right_pane)
-        right_pane.add(monitor_frame, weight=2)
+        right_pane.add(right_nb, weight=2)
         right_pane.add(graph_frame, weight=3)
 
         # Assign frames used by existing setup functions
         self.config_frame = left_frame
         self.monitor_frame = monitor_frame
+        self.zones_frame = zones_frame
         self.data_frame = graph_frame
 
         # Build the panels
         self.setup_config_tab()
         self.setup_monitor_tab()
+        self.setup_zones_tab()
         self.setup_graph_tab()
 
         # Keyboard shortcuts
@@ -184,15 +226,25 @@ class PLCTagReader:
         
         self.interval_var = tk.DoubleVar(value=1000.0)
         ttk.Spinbox(main, from_=1, to=60000, textvariable=self.interval_var, width=12).grid(row=1, column=1, sticky=tk.W, padx=5)
-        
+
+        # MQTT Broker
+        ttk.Label(main, text="MQTT Broker:", font=("Segoe UI", 9, "bold")).grid(row=2, column=0, sticky=tk.W, pady=4)
+        mqtt_frame = ttk.Frame(main)
+        mqtt_frame.grid(row=2, column=1, sticky=tk.EW, padx=5)
+        self.mqtt_broker_var = tk.StringVar(value=self.config.get("mqtt_broker", "localhost"))
+        ttk.Entry(mqtt_frame, textvariable=self.mqtt_broker_var, width=20).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Label(mqtt_frame, text="Port:").pack(side=tk.LEFT, padx=(6, 2))
+        self.mqtt_port_var = tk.IntVar(value=self.config.get("mqtt_port", 1883))
+        ttk.Spinbox(mqtt_frame, from_=1, to=65535, textvariable=self.mqtt_port_var, width=6).pack(side=tk.LEFT)
+
         # Separator
-        ttk.Separator(main, orient=tk.HORIZONTAL).grid(row=2, column=0, columnspan=2, sticky=tk.EW, pady=12)
+        ttk.Separator(main, orient=tk.HORIZONTAL).grid(row=3, column=0, columnspan=2, sticky=tk.EW, pady=12)
         
         # Tags section
-        ttk.Label(main, text="Add Tag:", font=("Segoe UI", 9, "bold")).grid(row=3, column=0, sticky=tk.W, pady=(8, 4))
+        ttk.Label(main, text="Add Tag:", font=("Segoe UI", 9, "bold")).grid(row=4, column=0, sticky=tk.W, pady=(8, 4))
         
         tag_frame = ttk.Frame(main)
-        tag_frame.grid(row=4, column=0, columnspan=2, sticky=tk.EW, padx=0, pady=(0, 8))
+        tag_frame.grid(row=5, column=0, columnspan=2, sticky=tk.EW, padx=0, pady=(0, 8))
         
         self.new_tag_entry = ttk.Entry(tag_frame, width=20)
         self.new_tag_entry.pack(side=tk.LEFT, padx=(0, 4), fill=tk.X, expand=True)
@@ -200,10 +252,10 @@ class PLCTagReader:
         ttk.Button(tag_frame, text="Add", command=self.add_tag, width=5).pack(side=tk.LEFT, padx=2)
         
         # Pair section
-        ttk.Label(main, text="Add Pair:", font=("Segoe UI", 9, "bold")).grid(row=5, column=0, sticky=tk.W, pady=(8, 4))
+        ttk.Label(main, text="Add Pair:", font=("Segoe UI", 9, "bold")).grid(row=6, column=0, sticky=tk.W, pady=(8, 4))
         
         pair_frame = ttk.Frame(main)
-        pair_frame.grid(row=6, column=0, columnspan=2, sticky=tk.EW, padx=0, pady=(0, 8))
+        pair_frame.grid(row=7, column=0, columnspan=2, sticky=tk.EW, padx=0, pady=(0, 8))
         
         ttk.Label(pair_frame, text="Name").pack(side=tk.LEFT, padx=(0, 2))
         self.pair_name_entry = ttk.Entry(pair_frame, width=10)
@@ -220,10 +272,10 @@ class PLCTagReader:
         ttk.Button(pair_frame, text="Add", command=self.add_tag_pair, width=5).pack(side=tk.LEFT, padx=2)
         
         # Consolidated list
-        ttk.Label(main, text="Monitored Items:", font=("Segoe UI", 9, "bold")).grid(row=7, column=0, columnspan=2, sticky=tk.W, pady=(12, 4))
+        ttk.Label(main, text="Monitored Items:", font=("Segoe UI", 9, "bold")).grid(row=8, column=0, columnspan=2, sticky=tk.W, pady=(12, 4))
         
         list_frame = ttk.Frame(main)
-        list_frame.grid(row=8, column=0, columnspan=2, sticky=(tk.W, tk.E, tk.N, tk.S), padx=0, pady=(0, 8))
+        list_frame.grid(row=9, column=0, columnspan=2, sticky=(tk.W, tk.E, tk.N, tk.S), padx=0, pady=(0, 8))
         
         scrollbar = ttk.Scrollbar(list_frame)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
@@ -233,10 +285,10 @@ class PLCTagReader:
         scrollbar.config(command=self.items_listbox.yview)
         
         # Remove button
-        ttk.Button(main, text="Remove Selected", command=self.remove_item).grid(row=9, column=0, columnspan=2, sticky=tk.W, pady=(0, 8))
+        ttk.Button(main, text="Remove Selected", command=self.remove_item).grid(row=10, column=0, columnspan=2, sticky=tk.W, pady=(0, 8))
         
         main.columnconfigure(1, weight=1)
-        main.rowconfigure(8, weight=1)
+        main.rowconfigure(9, weight=1)
     
     def setup_monitor_tab(self):
         """Setup the current readings display with two-column layout"""
@@ -287,8 +339,87 @@ class PLCTagReader:
         self.pairs_text.tag_config("pair_value", foreground="#ff6600", font=("Segoe UI", 10))
         self.pairs_text.tag_config("total", foreground="#ff0000", font=("Segoe UI", 11, "bold"))
         self.pairs_text.config(state=tk.DISABLED)
-    
-    def setup_graph_tab(self):
+
+    def setup_zones_tab(self):
+        """Setup the Conveyor Zones tab showing per-zone current count and daily total."""
+        main = ttk.Frame(self.zones_frame, padding="10")
+        main.pack(fill=tk.BOTH, expand=True)
+
+        ttk.Label(main, text="Conveyor Zone Counts", font=("Segoe UI", 11, "bold")).pack(anchor=tk.W, pady=(0, 8))
+
+        # 3×3 grid: Line 1 / Line 2 / Line 3
+        grid = ttk.Frame(main)
+        grid.pack(fill=tk.BOTH, expand=True)
+
+        headers = ["Zone", "Current\nCount", "Day\nTotal"]
+        for col, h in enumerate(headers):
+            ttk.Label(grid, text=h, font=("Segoe UI", 9, "bold"), anchor=tk.CENTER).grid(
+                row=0, column=col, padx=8, pady=4, sticky=tk.EW)
+
+        self._zone_current_vars = {}
+        self._zone_total_vars = {}
+
+        for idx, zone in enumerate(ZONES):
+            row = idx + 1
+            ttk.Label(grid, text=zone, font=("Segoe UI", 10, "bold"), width=6, anchor=tk.W).grid(
+                row=row, column=0, padx=8, pady=3, sticky=tk.W)
+
+            cur_var = tk.StringVar(value="0")
+            ttk.Label(grid, textvariable=cur_var, font=("Segoe UI", 10), width=8,
+                      anchor=tk.CENTER, foreground="#006600").grid(
+                row=row, column=1, padx=8, pady=3, sticky=tk.EW)
+
+            day_var = tk.StringVar(value="0")
+            ttk.Label(grid, textvariable=day_var, font=("Segoe UI", 10), width=8,
+                      anchor=tk.CENTER, foreground="#004499").grid(
+                row=row, column=2, padx=8, pady=3, sticky=tk.EW)
+
+            self._zone_current_vars[zone] = cur_var
+            self._zone_total_vars[zone] = day_var
+
+        ttk.Button(main, text="Reset Daily Totals", command=self._reset_daily_totals_ui).pack(
+            anchor=tk.W, pady=(12, 0))
+
+    def _refresh_zones_display(self):
+        """Update zone count labels from ZoneTracker snapshot (call from main thread)."""
+        snapshot = self.zone_tracker.get_snapshot()
+        for zone, data in snapshot.items():
+            if zone in self._zone_current_vars:
+                self._zone_current_vars[zone].set(str(data["current"]))
+                self._zone_total_vars[zone].set(str(data["day_total"]))
+
+    def _reset_daily_totals_ui(self):
+        """Reset daily totals from the UI button."""
+        if messagebox.askyesno("Reset", "Reset all daily totals to zero?"):
+            self.zone_tracker.reset_daily_totals()
+            self._last_reset_date = str(date.today())
+            self._refresh_zones_display()
+
+    def connect_mqtt(self):
+        """Connect (or reconnect) to the MQTT broker using current config."""
+        broker = self.mqtt_broker_var.get().strip() or "localhost"
+        port = self.mqtt_port_var.get()
+        self.config["mqtt_broker"] = broker
+        self.config["mqtt_port"] = port
+        self.save_config()
+
+        self.mqtt_service.disconnect()
+        self.mqtt_service = MQTTService(broker=broker, port=port)
+        ok = self.mqtt_service.connect()
+        if ok:
+            self.mqtt_status_pill.config(text="MQTT: Connecting…", bg="#f0c040", fg="#333")
+            # Poll until connected (max 5 s)
+            self.root.after(500, self._check_mqtt_status)
+        else:
+            self.mqtt_status_pill.config(text="MQTT: Error", bg="#cc4444", fg="white")
+
+    def _check_mqtt_status(self, attempts=0):
+        if self.mqtt_service.is_connected:
+            self.mqtt_status_pill.config(text="MQTT: Connected", bg="#44aa44", fg="white")
+        elif attempts < 10:
+            self.root.after(500, lambda: self._check_mqtt_status(attempts + 1))
+        else:
+            self.mqtt_status_pill.config(text="MQTT: Failed", bg="#cc4444", fg="white")
         """Setup the graph tab"""
         main = ttk.Frame(self.data_frame, padding="10")
         main.pack(fill=tk.BOTH, expand=True)
@@ -457,8 +588,11 @@ class PLCTagReader:
         if not ip:
             messagebox.showerror("Error", "Please enter an IP address")
             return
-        
-        if not self.active_tags:
+
+        # Allow polling even if no manual tags are configured, as long as
+        # zone sensor tags exist in sensor_tags.json
+        zone_sensor_tags = self.zone_tracker.get_all_tags()
+        if not self.active_tags and not zone_sensor_tags:
             messagebox.showerror("Error", "Please add at least one tag to monitor")
             return
         
@@ -491,10 +625,18 @@ class PLCTagReader:
                 if dec_tag not in self.previous_state:
                     dec_result = plc.Read(dec_tag)
                     self.previous_state[dec_tag] = dec_result.Value if str(dec_result.Status) == "Success" else False
+
+            # Initialize zone sensor tags to avoid false edges on first cycle
+            zone_init = {}
+            for tag in zone_sensor_tags:
+                r = plc.Read(tag)
+                zone_init[tag] = r.Value if str(r.Status) == "Success" else False
+            self.zone_tracker.init_prev_state(zone_init)
         except:
             self.previous_state = {}  # Fallback if init fails
         
         self.status_pill.config(text="Polling", bg="#4CAF50", fg="white")
+        self._last_mqtt_publish = time.time()
         
         self.poll_thread = threading.Thread(target=self.poll_loop, daemon=True)
         self.poll_thread.start()
@@ -512,6 +654,7 @@ class PLCTagReader:
         ip = self.ip_combo.get().strip()
         plc = PLC()
         plc.IPAddress = ip
+        zone_sensor_tags = self.zone_tracker.get_all_tags()
         
         while self.polling:
             try:
@@ -596,7 +739,32 @@ class PLCTagReader:
                             self.pulse_counts[tag] += 1
                         # Update the state for next iteration
                         self.previous_state[tag] = value
-                
+
+                # ── Conveyor zone sensor reading ──────────────────────
+                for tag in zone_sensor_tags:
+                    # Avoid re-reading if already fetched as a monitored tag
+                    if tag in current_tag_values:
+                        raw_value = current_tag_values[tag]
+                    else:
+                        r = plc.Read(tag)
+                        raw_value = r.Value if str(r.Status) == "Success" else False
+
+                    events = self.zone_tracker.process_reading(tag, raw_value)
+                    for zone, event_type, new_count in events:
+                        self.db_logger.log_event(zone, event_type, new_count, timestamp)
+
+                # ── Midnight daily-total reset ────────────────────────
+                today_str = str(timestamp.date())
+                if today_str != self._last_reset_date:
+                    self.zone_tracker.reset_daily_totals()
+                    self._last_reset_date = today_str
+
+                # ── MQTT periodic publish ─────────────────────────────
+                now = time.time()
+                if now - self._last_mqtt_publish >= MQTT_PUBLISH_INTERVAL:
+                    self.mqtt_service.publish(self.zone_tracker.get_snapshot())
+                    self._last_mqtt_publish = now
+
                 # Update monitor display
                 self.update_monitor_display(timestamp, poll_data)
                 
@@ -618,6 +786,9 @@ class PLCTagReader:
             if item[0] == 'readings':
                 self.update_readings_display(item[1])
         
+        # Refresh zone counts display
+        self._refresh_zones_display()
+
         # Auto-refresh graph every 500ms if polling
         try:
             if self.polling and self.tag_pairs:
