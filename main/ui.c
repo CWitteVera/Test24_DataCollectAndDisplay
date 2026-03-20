@@ -72,6 +72,8 @@ static lv_color_t count_to_color(int32_t v)
 {
     /* Map 0..VALUE_MAX to green→yellow→red */
     uint8_t r = 0, g = 0;
+    if (v <= 0) return lv_color_make(0, 200, 0);
+    if (v >= VALUE_MAX) return lv_color_make(220, 0, 0);
     int pct = (int)((int64_t)v * 100 / VALUE_MAX);
 
     if (pct <= 20) {

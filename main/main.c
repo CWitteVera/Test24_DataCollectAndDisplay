@@ -47,13 +47,19 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
     case MQTT_EVENT_DATA: {
         /* Parse JSON payload and update UI cells */
         char *payload = (char *)malloc(event->data_len + 1);
-        if (!payload) break;
+        if (!payload) {
+            ESP_LOGE(TAG, "MQTT: out of memory for payload (%d bytes)", event->data_len + 1);
+            break;
+        }
         memcpy(payload, event->data, event->data_len);
         payload[event->data_len] = '\0';
 
         cJSON *root = cJSON_Parse(payload);
         free(payload);
-        if (!root) break;
+        if (!root) {
+            ESP_LOGW(TAG, "MQTT: failed to parse JSON payload");
+            break;
+        }
 
         for (int i = 0; i < ZONE_COUNT; i++) {
             cJSON *zone = cJSON_GetObjectItemCaseSensitive(root, s_zone_names[i]);

@@ -105,7 +105,7 @@ class ZoneTracker:
         zone, sensor_type = mapping
         with self._lock:
             if sensor_type == "entry":
-                self.current_count[zone] = max(0, self.current_count[zone] + 1)
+                self.current_count[zone] += 1
                 self.daily_total[zone] += 1
                 new_count = self.current_count[zone]
             else:  # exit
